@@ -1,0 +1,20 @@
+# Dependencies
+**/node_modules/
+
+# Build outputs
+**/dist/
+**/target/
+**/src-tauri/gen/
+
+# Logs
+*.log
+**/*.log
+
+# Local environment and editor files
+.env
+.env.*
+!.env.example
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
