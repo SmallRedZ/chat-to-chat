@@ -137,6 +137,8 @@ pub struct TaskRecord {
     pub display_mode: DisplayMode,
     pub rounds: Vec<Round>,
     pub final_result: String,
+    #[serde(default)]
+    pub memory_summary: String,
     pub error: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -223,6 +225,7 @@ async fn start_task(
         display_mode: request.settings.display_mode.clone(),
         rounds: Vec::new(),
         final_result: String::new(),
+        memory_summary: String::new(),
         error: None,
         created_at: now.clone(),
         updated_at: now,
@@ -337,7 +340,6 @@ async fn run_task_loop(
     let ai1 = find_provider(&request.settings, &request.settings.role_config.ai1_provider_id)?;
     let ai2 = find_provider(&request.settings, &request.settings.role_config.ai2_provider_id)?;
     let template = find_template(&request.settings)?;
-    let mut previous_ai2_result = String::new();
     let mut round_index = 1;
 
     while should_run_round(round_index, task.max_rounds) {
@@ -348,7 +350,9 @@ async fn run_task_loop(
         }
 
         let started = Instant::now();
-        let ai1_prompt = build_ai1_prompt(&task.user_goal, round_index, &previous_ai2_result);
+        // 阶段 1：AI1 分析 / 规划（携带跨轮摘要记忆，而不是仅上一轮结果）。
+        emit_progress(app, &task.id, round_index, TaskPhase::Ai1Analyzing);
+        let ai1_prompt = build_ai1_prompt(&task.user_goal, round_index, &task.memory_summary);
         let ai1_plan = call_chat(
             ai1,
             &request.settings.role_config.ai1_system_prompt,
@@ -362,8 +366,11 @@ async fn run_task_loop(
             return Ok(());
         }
 
+        // 阶段 2：AI2 执行（同样注入摘要记忆作为背景）。
+        emit_progress(app, &task.id, round_index, TaskPhase::Ai2Executing);
         let local_context = build_local_file_context(&request.settings.ai2_local_paths)?;
-        let ai2_prompt = compose_ai2_prompt(template, &ai1_plan, &local_context);
+        let ai2_prompt =
+            compose_ai2_prompt(template, &ai1_plan, &local_context, &task.memory_summary);
         let raw_ai2_result = run_ai2_tool_agent(
             ai2,
             &request.settings.role_config.ai2_system_prompt,
@@ -375,7 +382,10 @@ async fn run_task_loop(
             apply_ai2_file_writes(&raw_ai2_result, &request.settings.ai2_local_paths)?;
         let ai2_result = append_write_summary(raw_ai2_result, write_summary);
 
-        let review_prompt = build_review_prompt(&task.user_goal, round_index, &ai2_result);
+        // 阶段 3：AI1 审核。
+        emit_progress(app, &task.id, round_index, TaskPhase::Ai1Reviewing);
+        let review_prompt =
+            build_review_prompt(&task.user_goal, round_index, &ai2_result, &task.memory_summary);
         let ai1_review = call_chat(
             ai1,
             &request.settings.role_config.ai1_system_prompt,
@@ -392,7 +402,7 @@ async fn run_task_loop(
 
         let round = Round {
             index: round_index,
-            ai1_plan,
+            ai1_plan: ai1_plan.clone(),
             ai2_prompt,
             ai2_result: ai2_result.clone(),
             ai1_review: ai1_review.clone(),
@@ -405,12 +415,35 @@ async fn run_task_loop(
         };
 
         task.rounds.push(round);
-        task.final_result = if succeeded { ai2_result.clone() } else { ai1_review };
+        task.final_result = if succeeded {
+            ai2_result.clone()
+        } else {
+            ai1_review.clone()
+        };
         task.status = if succeeded {
             TaskStatus::Succeeded
         } else {
             TaskStatus::Running
         };
+
+        // 复用 AI1 更新摘要记忆。仅在还会有下一轮时更新（成功或最后一轮跳过，
+        // 以节省一次模型调用）。摘要更新是尽力而为：模型失败时回退到本地确定性摘要，
+        // 不让已完成的本轮进度因摘要调用失败而丢失或整体报错。
+        if !succeeded && should_run_round(round_index + 1, task.max_rounds) {
+            let new_summary = update_memory_summary(
+                ai1,
+                &request.settings.role_config.ai1_system_prompt,
+                &task.user_goal,
+                round_index,
+                &task.memory_summary,
+                &ai1_plan,
+                &ai2_result,
+                &ai1_review,
+            )
+            .await;
+            task.memory_summary = new_summary;
+        }
+
         task.updated_at = timestamp();
         upsert_task(app, task)?;
         emit_task(app, task);
@@ -419,7 +452,6 @@ async fn run_task_loop(
             return Ok(());
         }
 
-        previous_ai2_result = ai2_result;
         round_index += 1;
     }
 
@@ -662,6 +694,26 @@ fn emit_task(app: &AppHandle, task: &TaskRecord) {
     let _ = app.emit("task-updated", task.clone());
 }
 
+/// 阶段级实时进度。这是临时事件，不写入 `Round` 历史，也不持久化。
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+enum TaskPhase {
+    Ai1Analyzing,
+    Ai2Executing,
+    Ai1Reviewing,
+}
+
+fn emit_progress(app: &AppHandle, task_id: &str, round_index: u32, phase: TaskPhase) {
+    let _ = app.emit(
+        "task-progress",
+        json!({
+            "taskId": task_id,
+            "roundIndex": round_index,
+            "phase": phase,
+        }),
+    );
+}
+
 fn find_provider<'a>(settings: &'a Settings, id: &str) -> Result<&'a ProviderConfig, String> {
     settings
         .providers
@@ -679,27 +731,49 @@ fn find_template(settings: &Settings) -> Result<&PromptTemplate, String> {
         .ok_or_else(|| "至少需要一个提示词模板".to_string())
 }
 
-fn build_ai1_prompt(user_goal: &str, round_index: u32, previous_ai2_result: &str) -> String {
-    if round_index == 1 {
+fn build_ai1_prompt(user_goal: &str, round_index: u32, memory_summary: &str) -> String {
+    if round_index == 1 || memory_summary.trim().is_empty() {
         format!(
             "用户目标:\n{user_goal}\n\n请分析需求，给出可以直接交给 AI2 执行的方案。"
         )
     } else {
         format!(
-            "用户目标:\n{user_goal}\n\n上一轮 AI2 执行结果:\n{previous_ai2_result}\n\n请审核上一轮结果，给出下一轮可以直接交给 AI2 执行的改进方案。"
+            "用户目标:\n{user_goal}\n\n协作记忆摘要（历史进展，请基于它规划，不要重复已完成的步骤）:\n{}\n\n请基于摘要判断进展，给出下一轮可以直接交给 AI2 执行的改进方案。",
+            memory_summary.trim()
         )
     }
 }
 
-fn build_review_prompt(user_goal: &str, round_index: u32, ai2_result: &str) -> String {
+fn build_review_prompt(
+    user_goal: &str,
+    round_index: u32,
+    ai2_result: &str,
+    memory_summary: &str,
+) -> String {
+    let memory_block = if memory_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\n\n协作记忆摘要:\n{}", memory_summary.trim())
+    };
     format!(
-        "用户目标:\n{user_goal}\n\n第 {round_index} 轮 AI2 执行结果:\n{ai2_result}\n\n请审核结果是否已经达到用户目标。如果达到，请明确写出“成功”；如果没有达到，请明确写出“继续”并说明下一步。"
+        "用户目标:\n{user_goal}{memory_block}\n\n第 {round_index} 轮 AI2 执行结果:\n{ai2_result}\n\n请审核结果是否已经达到用户目标。如果达到，请明确写出“成功”；如果没有达到，请明确写出“继续”并说明下一步。"
     )
 }
 
-fn compose_ai2_prompt(template: &PromptTemplate, ai1_content: &str, local_context: &str) -> String {
+fn compose_ai2_prompt(
+    template: &PromptTemplate,
+    ai1_content: &str,
+    local_context: &str,
+    memory_summary: &str,
+) -> String {
+    let memory_block = if memory_summary.trim().is_empty() {
+        String::new()
+    } else {
+        format!("协作记忆摘要（仅供参考的历史进展）:\n{}", memory_summary.trim())
+    };
     [
         template.prefix.as_str(),
+        memory_block.as_str(),
         ai1_content,
         local_context,
         template.suffix.as_str(),
@@ -709,6 +783,67 @@ fn compose_ai2_prompt(template: &PromptTemplate, ai1_content: &str, local_contex
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// 复用 AI1 生成 / 更新协作记忆摘要。尽力而为：模型失败或返回空时回退到本地确定性摘要。
+async fn update_memory_summary(
+    provider: &ProviderConfig,
+    system_prompt: &str,
+    user_goal: &str,
+    round_index: u32,
+    previous_summary: &str,
+    ai1_plan: &str,
+    ai2_result: &str,
+    ai1_review: &str,
+) -> String {
+    let prompt = build_summary_prompt(
+        user_goal,
+        round_index,
+        previous_summary,
+        ai1_plan,
+        ai2_result,
+        ai1_review,
+    );
+    match call_chat(provider, system_prompt, &prompt).await {
+        Ok(summary) if !summary.trim().is_empty() => summary.trim().to_string(),
+        _ => fallback_summary(user_goal, round_index, ai2_result, ai1_review),
+    }
+}
+
+fn build_summary_prompt(
+    user_goal: &str,
+    round_index: u32,
+    previous_summary: &str,
+    ai1_plan: &str,
+    ai2_result: &str,
+    ai1_review: &str,
+) -> String {
+    let previous_block = if previous_summary.trim().is_empty() {
+        "（暂无历史摘要）".to_string()
+    } else {
+        previous_summary.trim().to_string()
+    };
+    format!(
+        "你正在维护一份“协作记忆摘要”，它会作为后续每一轮 AI1 规划与 AI2 执行的唯一历史上下文。请结合已有摘要与本轮新信息，输出一份更新后的摘要。\n\n用户目标:\n{user_goal}\n\n已有摘要:\n{previous_block}\n\n第 {round_index} 轮 AI1 方案:\n{ai1_plan}\n\n第 {round_index} 轮 AI2 执行结果:\n{ai2_result}\n\n第 {round_index} 轮 AI1 审核:\n{ai1_review}\n\n请只输出更新后的摘要本身，使用以下固定小节，不要添加额外解释或代码块:\n用户目标:\n已完成内容:\n当前未达标原因:\n下一轮重点:\n关键约束:"
+    )
+}
+
+fn fallback_summary(user_goal: &str, round_index: u32, ai2_result: &str, ai1_review: &str) -> String {
+    format!(
+        "用户目标:\n{user_goal}\n已完成内容:\n截至第 {round_index} 轮，AI2 最新执行结果摘录：{}\n当前未达标原因:\nAI1 最新审核：{}\n下一轮重点:\n根据上述审核继续改进，直到满足用户目标。\n关键约束:\n沿用既有约束，不引入与用户目标无关的改动。",
+        truncate_for_summary(ai2_result, 600),
+        truncate_for_summary(ai1_review, 600),
+    )
+}
+
+fn truncate_for_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let truncated: String = trimmed.chars().take(max_chars).collect();
+    if trimmed.chars().count() > max_chars {
+        format!("{truncated}……")
+    } else {
+        truncated
+    }
 }
 
 fn build_local_file_context(paths: &[String]) -> Result<String, String> {
@@ -1445,10 +1580,137 @@ mod tests {
             suffix: "后缀".into(),
         };
 
+        // 空摘要时行为与历史一致，保证向后兼容。
         assert_eq!(
-            compose_ai2_prompt(&template, "正文", "文件"),
+            compose_ai2_prompt(&template, "正文", "文件", ""),
             "前缀\n\n正文\n\n文件\n\n后缀"
         );
+    }
+
+    #[test]
+    fn compose_prompt_injects_memory_summary() {
+        let template = PromptTemplate {
+            id: "t".into(),
+            name: "T".into(),
+            prefix: "前缀".into(),
+            suffix: "后缀".into(),
+        };
+
+        let prompt = compose_ai2_prompt(&template, "正文", "文件", "已完成内容: 第一步");
+        assert!(prompt.contains("协作记忆摘要"));
+        assert!(prompt.contains("已完成内容: 第一步"));
+        // 摘要块位于前缀之后、正文之前。
+        let summary_at = prompt.find("协作记忆摘要").unwrap();
+        let body_at = prompt.find("正文").unwrap();
+        assert!(summary_at < body_at);
+    }
+
+    #[test]
+    fn ai1_prompt_injects_summary_only_after_first_round() {
+        let summary = "用户目标:\n做事\n下一轮重点:\n继续";
+        // 第 1 轮不注入摘要。
+        let first = build_ai1_prompt("做事", 1, summary);
+        assert!(!first.contains("协作记忆摘要"));
+        // 第 2 轮注入摘要。
+        let second = build_ai1_prompt("做事", 2, summary);
+        assert!(second.contains("协作记忆摘要"));
+        assert!(second.contains("下一轮重点"));
+        // 第 2 轮但摘要为空时退回基础提示。
+        let empty = build_ai1_prompt("做事", 2, "");
+        assert!(!empty.contains("协作记忆摘要"));
+    }
+
+    #[test]
+    fn review_prompt_injects_summary_when_present() {
+        let with_summary = build_review_prompt("做事", 2, "结果", "下一轮重点:\n收尾");
+        assert!(with_summary.contains("协作记忆摘要"));
+        assert!(with_summary.contains("收尾"));
+
+        let without_summary = build_review_prompt("做事", 1, "结果", "");
+        assert!(!without_summary.contains("协作记忆摘要"));
+    }
+
+    #[test]
+    fn summary_prompt_and_fallback_cover_required_sections() {
+        let prompt = build_summary_prompt("目标X", 3, "旧摘要", "方案", "执行结果", "审核结论");
+        for section in [
+            "用户目标:",
+            "已完成内容:",
+            "当前未达标原因:",
+            "下一轮重点:",
+            "关键约束:",
+        ] {
+            assert!(prompt.contains(section), "summary prompt missing {section}");
+        }
+        assert!(prompt.contains("目标X"));
+        assert!(prompt.contains("旧摘要"));
+
+        let fallback = fallback_summary("目标X", 3, "执行结果", "审核结论");
+        for section in [
+            "用户目标:",
+            "已完成内容:",
+            "当前未达标原因:",
+            "下一轮重点:",
+            "关键约束:",
+        ] {
+            assert!(fallback.contains(section), "fallback summary missing {section}");
+        }
+        assert!(fallback.contains("执行结果"));
+        assert!(fallback.contains("审核结论"));
+    }
+
+    #[test]
+    fn task_record_without_memory_summary_deserializes() {
+        // 模拟旧版历史：TaskRecord 没有 memorySummary 字段，必须能加载并默认空串。
+        let legacy = r#"{
+            "id": "t1",
+            "userGoal": "旧目标",
+            "maxRounds": 3,
+            "status": "succeeded",
+            "successMode": "ai1Judgement",
+            "displayMode": "dual",
+            "rounds": [],
+            "finalResult": "done",
+            "error": null,
+            "createdAt": "2024-01-01T00:00:00Z",
+            "updatedAt": "2024-01-01T00:00:00Z"
+        }"#;
+
+        let task: TaskRecord = serde_json::from_str(legacy).unwrap();
+        assert_eq!(task.memory_summary, "");
+        assert_eq!(task.user_goal, "旧目标");
+    }
+
+    #[test]
+    fn stored_data_with_legacy_tasks_loads() {
+        // 旧版整文件（tasks 缺 memorySummary）应能整体反序列化。
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(DATA_FILE);
+        let mut data = StoredData::default();
+        data.tasks.push(TaskRecord {
+            id: "legacy".into(),
+            user_goal: "旧任务".into(),
+            max_rounds: 1,
+            status: TaskStatus::Succeeded,
+            success_mode: SuccessMode::Manual,
+            display_mode: DisplayMode::Timeline,
+            rounds: Vec::new(),
+            final_result: String::new(),
+            memory_summary: String::new(),
+            error: None,
+            created_at: "2024-01-01T00:00:00Z".into(),
+            updated_at: "2024-01-01T00:00:00Z".into(),
+        });
+        // 序列化后移除 memorySummary 模拟旧数据文件。
+        let mut json = serde_json::to_value(&data).unwrap();
+        if let Some(task) = json["tasks"][0].as_object_mut() {
+            task.remove("memorySummary");
+        }
+        fs::write(&path, serde_json::to_string_pretty(&json).unwrap()).unwrap();
+
+        let loaded = read_data_from_path(&path).unwrap();
+        assert_eq!(loaded.tasks.len(), 1);
+        assert_eq!(loaded.tasks[0].memory_summary, "");
     }
 
     #[test]

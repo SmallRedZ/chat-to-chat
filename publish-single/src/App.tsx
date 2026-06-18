@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
+  ArrowLeftRight,
   CheckCircle2,
   Clock3,
   Columns3,
@@ -29,6 +30,13 @@ type TaskStatus =
   | "failed"
   | "limitReached";
 type RoundStatus = "completed" | "succeeded" | "failed";
+type TaskPhase = "ai1Analyzing" | "ai2Executing" | "ai1Reviewing";
+
+type TaskProgress = {
+  taskId: string;
+  roundIndex: number;
+  phase: TaskPhase;
+};
 
 type ProviderConfig = {
   id: string;
@@ -84,6 +92,7 @@ type TaskRecord = {
   displayMode: DisplayMode;
   rounds: Round[];
   finalResult: string;
+  memorySummary: string;
   error?: string | null;
   createdAt: string;
   updatedAt: string;
@@ -161,6 +170,12 @@ const displayModeText: Record<DisplayMode, string> = {
   focus: "当前轮",
 };
 
+const phaseText: Record<TaskPhase, string> = {
+  ai1Analyzing: "AI1 分析中",
+  ai2Executing: "AI2 执行中",
+  ai1Reviewing: "AI1 审核中",
+};
+
 function App() {
   const [settings, setSettings] = useState<Settings>(cloneSettings());
   const [settingsDraft, setSettingsDraft] = useState<Settings>(cloneSettings());
@@ -174,6 +189,7 @@ function App() {
   const [providerTests, setProviderTests] = useState<
     Record<string, { status: "idle" | "testing" | "success" | "error"; message: string }>
   >({});
+  const [progress, setProgress] = useState<Record<string, TaskProgress | undefined>>({});
 
   const currentTask = useMemo(
     () => tasks.find((task) => task.id === currentTaskId) ?? tasks[0],
@@ -183,20 +199,39 @@ function App() {
   const isLiveTask =
     currentTask?.status === "running" || currentTask?.status === "paused";
 
+  const hasLiveTask = useMemo(
+    () => tasks.some((task) => task.status === "running" || task.status === "paused"),
+    [tasks],
+  );
+
+  const currentProgress =
+    isLiveTask && currentTask ? progress[currentTask.id] : undefined;
+
   useEffect(() => {
     void bootstrap();
     if (!isTauriRuntime()) return;
 
-    let unlisten: null | (() => void) = null;
+    let unlistenTask: null | (() => void) = null;
+    let unlistenProgress: null | (() => void) = null;
+
     void listen<TaskRecord>("task-updated", (event) => {
       setTasks((items) => upsertTask(items, event.payload));
       setCurrentTaskId(event.payload.id);
+      // 一轮结束或状态变化后，清掉该任务的临时阶段指示，等待下一阶段事件。
+      setProgress((items) => ({ ...items, [event.payload.id]: undefined }));
     }).then((fn) => {
-      unlisten = fn;
+      unlistenTask = fn;
+    });
+
+    void listen<TaskProgress>("task-progress", (event) => {
+      setProgress((items) => ({ ...items, [event.payload.taskId]: event.payload }));
+    }).then((fn) => {
+      unlistenProgress = fn;
     });
 
     return () => {
-      unlisten?.();
+      unlistenTask?.();
+      unlistenProgress?.();
     };
   }, []);
 
@@ -434,7 +469,12 @@ function App() {
           />
         </section>
 
-        <TaskView task={currentTask} mode={settings.displayMode} onDelete={removeTask} />
+        <TaskView
+          task={currentTask}
+          mode={settings.displayMode}
+          onDelete={removeTask}
+          phase={currentProgress}
+        />
       </section>
 
       {settingsOpen ? (
@@ -445,6 +485,7 @@ function App() {
           onSave={saveSettings}
           providerTests={providerTests}
           onTestProvider={testProvider}
+          canSwap={!hasLiveTask}
         />
       ) : null}
     </main>
@@ -455,10 +496,12 @@ function TaskView({
   task,
   mode,
   onDelete,
+  phase,
 }: {
   task?: TaskRecord;
   mode: DisplayMode;
   onDelete: (taskId: string) => void;
+  phase?: TaskProgress;
 }) {
   if (!task) {
     return (
@@ -489,9 +532,23 @@ function TaskView({
 
       {task.error ? <div className="error-bar">{task.error}</div> : null}
 
+      {phase ? (
+        <div className="phase-indicator">
+          <span className="phase-dot" />
+          第 {phase.roundIndex} 轮 · {phaseText[phase.phase]}
+        </div>
+      ) : null}
+
       {mode === "dual" ? <DualRounds rounds={task.rounds} /> : null}
       {mode === "timeline" ? <TimelineRounds rounds={task.rounds} /> : null}
       {mode === "focus" ? <FocusRound round={latest} /> : null}
+
+      {task.memorySummary ? (
+        <article className="memory-summary">
+          <h3>协作记忆摘要</h3>
+          <pre>{task.memorySummary}</pre>
+        </article>
+      ) : null}
 
       {task.finalResult ? (
         <article className="final-result">
@@ -589,6 +646,7 @@ function SettingsModal({
   onSave,
   providerTests,
   onTestProvider,
+  canSwap,
 }: {
   draft: Settings;
   setDraft: (settings: Settings) => void;
@@ -599,6 +657,7 @@ function SettingsModal({
     { status: "idle" | "testing" | "success" | "error"; message: string }
   >;
   onTestProvider: (provider: ProviderConfig, systemPrompt: string) => Promise<void>;
+  canSwap: boolean;
 }) {
   const ai1Provider = draft.providers.find(
     (provider) => provider.id === draft.roleConfig.ai1ProviderId,
@@ -621,6 +680,20 @@ function SettingsModal({
 
   function updateRoleConfig(patch: Partial<RoleConfig>) {
     setDraft({ ...draft, roleConfig: { ...draft.roleConfig, ...patch } });
+  }
+
+  function swapRoles() {
+    if (!canSwap) return;
+    setDraft({
+      ...draft,
+      roleConfig: {
+        ...draft.roleConfig,
+        ai1ProviderId: draft.roleConfig.ai2ProviderId,
+        ai2ProviderId: draft.roleConfig.ai1ProviderId,
+        ai1SystemPrompt: draft.roleConfig.ai2SystemPrompt,
+        ai2SystemPrompt: draft.roleConfig.ai1SystemPrompt,
+      },
+    });
   }
 
   function updateActiveTemplate(patch: Partial<PromptTemplate>) {
@@ -702,6 +775,17 @@ function SettingsModal({
         </header>
 
         <div className="settings-grid">
+          <div className="swap-row">
+            <button className="ghost-button" onClick={swapRoles} disabled={!canSwap}>
+              <ArrowLeftRight size={16} />
+              交换 AI1 / AI2
+            </button>
+            <small>
+              {canSwap
+                ? "交换两侧的模型配置与系统提示词，保存后生效（仅任务开始前可用）。"
+                : "运行中或暂停中任务存在时不可交换。"}
+            </small>
+          </div>
           {ai1Provider ? (
             <ProviderPanel
               title="AI1 分析 / 审核"
